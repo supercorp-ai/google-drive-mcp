@@ -56,6 +56,7 @@ class MemoryStorage implements Storage {
   }
 
   async set(memoryKey: string, data: Record<string, any>) {
+    // Merge new data with existing data so that a previously stored refreshToken is preserved.
     this.storage[memoryKey] = { ...this.storage[memoryKey], ...data };
   }
 }
@@ -94,12 +95,17 @@ function getDriveScopes(): string[] {
   ];
 }
 
+/**
+ * Creates an OAuth2 client using stored credentials.
+ * Throws an error if no refresh token is found.
+ */
 async function createOAuth2Client(config: Config, storage: Storage, memoryKey: string): Promise<OAuth2Client> {
   const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
   const stored = await storage.get(memoryKey);
-  if (stored && stored.refreshToken) {
-    client.setCredentials({ refresh_token: stored.refreshToken });
+  if (!stored || !stored.refreshToken) {
+    throw new Error('No refresh token found. Please exchange an auth code first.');
   }
+  client.setCredentials({ refresh_token: stored.refreshToken, access_token: stored.accessToken });
   return client;
 }
 
@@ -108,7 +114,11 @@ async function getDriveClient(config: Config, storage: Storage, memoryKey: strin
   return google.drive({ version: 'v3', auth: oauth2Client });
 }
 
-function getAuthUrl(config: Config, memoryKey: string, storage: Storage): string {
+/**
+ * Returns an OAuth URL for initiating Drive authentication.
+ * Note: memoryKey and storage are not needed for this function.
+ */
+function getAuthUrl(config: Config): string {
   const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
   return client.generateAuthUrl({
     access_type: 'offline',
@@ -117,15 +127,38 @@ function getAuthUrl(config: Config, memoryKey: string, storage: Storage): string
   });
 }
 
+/**
+ * Exchanges an auth code for tokens and stores the refresh token (and access token).
+ */
+async function exchangeAuthCode(code: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
+  const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
+  const { tokens } = await client.getToken(code.trim());
+  if (!tokens.refresh_token) {
+    throw new Error('No refresh token returned by Google.');
+  }
+  client.setCredentials(tokens);
+  await storage.set(memoryKey, { refreshToken: tokens.refresh_token, accessToken: tokens.access_token });
+  return tokens.refresh_token;
+}
+
+/**
+ * Saves an access token provided by the client.
+ * Merges with existing stored tokens so that refreshToken is preserved.
+ */
 async function saveToken(token: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
-  const client = await createOAuth2Client(config, storage, memoryKey);
+  let client: OAuth2Client;
+  try {
+    client = await createOAuth2Client(config, storage, memoryKey);
+  } catch {
+    client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
+  }
   client.setCredentials({ access_token: token });
   await storage.set(memoryKey, { accessToken: token });
   return token;
 }
 
 // --------------------------------------------------------------------
-// Google Drive API Helpers
+// Google Drive API Methods
 // --------------------------------------------------------------------
 async function listFiles(
   args: { pageSize?: number; query?: string } = {},
@@ -165,16 +198,13 @@ async function getFileMetadata(
   }
 }
 
-// Updated: Use a single object parameter for readFile to avoid optional parameter issues.
-async function readFile(params: { fileId: string; exportMimeType?: string; config: Config; storage: Storage; memoryKey: string })
-  : Promise<{ content?: string } | { error: string }> {
+async function readFile(
+  params: { fileId: string; exportMimeType?: string; config: Config; storage: Storage; memoryKey: string }
+): Promise<{ content?: string } | { error: string }> {
   const { fileId, exportMimeType, config, storage, memoryKey } = params;
   try {
     const drive = await getDriveClient(config, storage, memoryKey);
-    const meta = await drive.files.get({
-      fileId,
-      fields: 'mimeType'
-    });
+    const meta = await drive.files.get({ fileId, fields: 'mimeType' });
     const fileMimeType = meta.data.mimeType;
     const exportMimeMap: { [key: string]: string } = {
       'application/vnd.google-apps.document': 'text/plain',
@@ -211,10 +241,7 @@ async function moveFile(
       removeParents: previousParents,
       fields: 'id, parents'
     });
-    return {
-      id: res.data.id === null ? undefined : res.data.id,
-      parents: res.data.parents ?? undefined
-    };
+    return { id: res.data.id === null ? undefined : res.data.id, parents: res.data.parents ?? undefined };
   } catch (err: any) {
     return { error: String(err.message) };
   }
@@ -287,19 +314,46 @@ async function deleteFile(
 // --------------------------------------------------------------------
 // MCP Server Creation: Register Google Drive Tools
 // --------------------------------------------------------------------
-function createMcpServer(memoryKey: string, config: Config): McpServer {
+function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string): McpServer {
   const server = new McpServer({
     name: `Google Drive MCP Server (Memory Key: ${memoryKey})`,
     version: '1.0.0'
   });
-
   const storage: Storage = config.storage === 'upstash-redis-rest'
     ? new RedisStorage(config.upstashRedisRestUrl!, config.upstashRedisRestToken!, config.storageHeaderKey!)
     : new MemoryStorage();
 
   server.tool(
-    'save_token',
-    'Save an access token from the client for Google Drive access',
+    `${toolsPrefix}auth_url`,
+    'Return an OAuth URL for Google Drive. Visit this URL to grant access.',
+    {},
+    async () => {
+      try {
+        const url = getAuthUrl(config);
+        return toTextJson({ authUrl: url });
+      } catch (err: any) {
+        return toTextJson({ error: String(err.message) });
+      }
+    }
+  );
+
+  server.tool(
+    `${toolsPrefix}exchange_auth_code`,
+    'Exchange an auth code for a refresh token. This sets up Google Drive authentication.',
+    { code: z.string() },
+    async (args: { code: string }) => {
+      try {
+        const token = await exchangeAuthCode(args.code, config, storage, memoryKey);
+        return toTextJson({ refreshToken: token });
+      } catch (err: any) {
+        return toTextJson({ error: String(err.message) });
+      }
+    }
+  );
+
+  server.tool(
+    `${toolsPrefix}save_token`,
+    'Save an access token from the client for Google Drive access.',
     { token: z.string() },
     async ({ token }) => {
       try {
@@ -312,8 +366,8 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'list_files',
-    'List files in Google Drive',
+    `${toolsPrefix}list_files`,
+    'List files in Google Drive.',
     { pageSize: z.number().optional(), query: z.string().optional() },
     async (args) => {
       const result = await listFiles(args, config, storage, memoryKey);
@@ -322,8 +376,8 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'get_file_metadata',
-    'Get metadata for a specific file',
+    `${toolsPrefix}get_file_metadata`,
+    'Get metadata for a specific file.',
     { fileId: z.string() },
     async ({ fileId }) => {
       const result = await getFileMetadata(fileId, config, storage, memoryKey);
@@ -332,8 +386,8 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'read_file',
-    'Read file content from Google Drive',
+    `${toolsPrefix}read_file`,
+    'Read file content from Google Drive.',
     { fileId: z.string(), exportMimeType: z.string().optional() },
     async ({ fileId, exportMimeType }) => {
       const result = await readFile({ fileId, exportMimeType, config, storage, memoryKey });
@@ -342,8 +396,8 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'create_file',
-    'Create a new file on Google Drive',
+    `${toolsPrefix}create_file`,
+    'Create a new file on Google Drive.',
     { name: z.string(), mimeType: z.string().optional(), content: z.string() },
     async (args) => {
       const result = await createFile(args, config, storage, memoryKey);
@@ -352,8 +406,8 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'update_file',
-    'Update an existing file on Google Drive',
+    `${toolsPrefix}update_file`,
+    'Update an existing file on Google Drive.',
     { fileId: z.string(), name: z.string().optional(), mimeType: z.string().optional(), content: z.string() },
     async (args) => {
       const result = await updateFile(args, config, storage, memoryKey);
@@ -362,8 +416,8 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'delete_file',
-    'Delete a file from Google Drive',
+    `${toolsPrefix}delete_file`,
+    'Delete a file from Google Drive.',
     { fileId: z.string() },
     async ({ fileId }) => {
       const result = await deleteFile(fileId, config, storage, memoryKey);
@@ -372,8 +426,8 @@ function createMcpServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'move_file',
-    'Move a file to a new folder on Google Drive',
+    `${toolsPrefix}move_file`,
+    'Move a file to a new folder on Google Drive.',
     { fileId: z.string(), newFolderId: z.string() },
     async ({ fileId, newFolderId }) => {
       const result = await moveFile(fileId, newFolderId, config, storage, memoryKey);
@@ -433,6 +487,7 @@ async function main() {
     .option('googleClientId', { type: 'string', demandOption: true, describe: "Google Client ID" })
     .option('googleClientSecret', { type: 'string', demandOption: true, describe: "Google Client Secret" })
     .option('googleRedirectUri', { type: 'string', demandOption: true, describe: "Google Redirect URI" })
+    .option('toolsPrefix', { type: 'string', default: 'google_drive_', describe: 'Prefix to add to all tool names.' })
     .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
     .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
     .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
@@ -472,9 +527,11 @@ async function main() {
     }
   }
 
+  const toolsPrefix: string = argv.toolsPrefix;
+
   if (config.transport === 'stdio') {
     const memoryKey = "single";
-    const server = createMcpServer(memoryKey, config);
+    const server = createMcpServer(memoryKey, config, toolsPrefix);
     const transport = new StdioServerTransport();
     void server.connect(transport);
     console.log('Listening on stdio');
@@ -508,7 +565,7 @@ async function main() {
       }
       memoryKey = headerVal.trim();
     }
-    const server = createMcpServer(memoryKey, config);
+    const server = createMcpServer(memoryKey, config, toolsPrefix);
     const transport = new SSEServerTransport('/message', res);
     await server.connect(transport);
     const sessionId = transport.sessionId;
