@@ -1,104 +1,192 @@
 #!/usr/bin/env node
 
-import yargs from 'yargs'
 import { hideBin } from 'yargs/helpers'
-import express, { Request, Response } from 'express'
+import yargs from 'yargs'
+import express, { Request, Response as ExpressResponse } from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { google, drive_v3 } from 'googleapis'
 import { OAuth2Client } from 'google-auth-library'
+import { Redis } from '@upstash/redis'
 
 // --------------------------------------------------------------------
-// 1) Parse CLI options (client credentials are passed via CLI only)
+// Helper: JSON Response Formatter
 // --------------------------------------------------------------------
-const argv = yargs(hideBin(process.argv))
-  .option('port', { type: 'number', default: 8000 })
-  .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
-  .option('clientId', { type: 'string', demandOption: true, describe: 'Google Client ID' })
-  .option('clientSecret', { type: 'string', demandOption: true, describe: 'Google Client Secret' })
-  .option('redirectUri', { type: 'string', demandOption: true, describe: 'Google Redirect URI' })
-  .help()
-  .parseSync()
-
-const log = (...args: any[]) => console.log('[google-drive-mcp]', ...args)
-const logErr = (...args: any[]) => console.error('[google-drive-mcp]', ...args)
-
-// --------------------------------------------------------------------
-// 2) Setup OAuth2 Client and Drive client using CLI credentials
-// --------------------------------------------------------------------
-const CLIENT_ID = argv.clientId;
-const CLIENT_SECRET = argv.clientSecret;
-const REDIRECT_URI = argv.redirectUri;
-
-const oauth2Client = new OAuth2Client(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
-// No token is set initially; the client must supply it via the save_token tool.
-
-const drive = google.drive({ version: 'v3', auth: oauth2Client })
-
-// --------------------------------------------------------------------
-// 3) Helper: Wrap responses in required MCP format
-// --------------------------------------------------------------------
-function wrapResponse(data: any): { content: { type: 'text'; text: string }[] } {
-  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] }
+function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(data, null, 2)
+      }
+    ]
+  };
 }
 
 // --------------------------------------------------------------------
-// 4) Helper Functions for Drive Operations
+// Configuration & Storage Interface
 // --------------------------------------------------------------------
-async function listFiles(args: { pageSize?: number; query?: string } = {}): Promise<{ nextPageToken?: string | null; files?: drive_v3.Schema$File[] } | { error: string }> {
+interface Config {
+  port: number;
+  transport: 'sse' | 'stdio';
+  storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
+  googleClientId: string;
+  googleClientSecret: string;
+  googleRedirectUri: string;
+  storageHeaderKey?: string;
+  upstashRedisRestUrl?: string;
+  upstashRedisRestToken?: string;
+}
+
+interface Storage {
+  get(memoryKey: string): Promise<Record<string, any> | undefined>;
+  set(memoryKey: string, data: Record<string, any>): Promise<void>;
+}
+
+// --------------------------------------------------------------------
+// In-Memory Storage Implementation
+// --------------------------------------------------------------------
+class MemoryStorage implements Storage {
+  private storage: Record<string, Record<string, any>> = {};
+
+  async get(memoryKey: string) {
+    return this.storage[memoryKey];
+  }
+
+  async set(memoryKey: string, data: Record<string, any>) {
+    this.storage[memoryKey] = { ...this.storage[memoryKey], ...data };
+  }
+}
+
+// --------------------------------------------------------------------
+// Upstash Redis Storage Implementation
+// --------------------------------------------------------------------
+class RedisStorage implements Storage {
+  private redis: Redis;
+  private keyPrefix: string;
+
+  constructor(redisUrl: string, redisToken: string, keyPrefix: string) {
+    this.redis = new Redis({ url: redisUrl, token: redisToken });
+    this.keyPrefix = keyPrefix;
+  }
+
+  async get(memoryKey: string): Promise<Record<string, any> | undefined> {
+    const data = await this.redis.get<Record<string, any>>(`${this.keyPrefix}:${memoryKey}`);
+    return data === null ? undefined : data;
+  }
+
+  async set(memoryKey: string, data: Record<string, any>) {
+    const existing = (await this.get(memoryKey)) || {};
+    const newData = { ...existing, ...data };
+    await this.redis.set(`${this.keyPrefix}:${memoryKey}`, JSON.stringify(newData));
+  }
+}
+
+// --------------------------------------------------------------------
+// Google Drive OAuth & API Helpers
+// --------------------------------------------------------------------
+function getDriveScopes(): string[] {
+  return [
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.file'
+  ];
+}
+
+async function createOAuth2Client(config: Config, storage: Storage, memoryKey: string): Promise<OAuth2Client> {
+  const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
+  const stored = await storage.get(memoryKey);
+  if (stored && stored.refreshToken) {
+    client.setCredentials({ refresh_token: stored.refreshToken });
+  }
+  return client;
+}
+
+async function getDriveClient(config: Config, storage: Storage, memoryKey: string): Promise<drive_v3.Drive> {
+  const oauth2Client = await createOAuth2Client(config, storage, memoryKey);
+  return google.drive({ version: 'v3', auth: oauth2Client });
+}
+
+function getAuthUrl(config: Config, memoryKey: string, storage: Storage): string {
+  const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
+  return client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: getDriveScopes(),
+  });
+}
+
+async function saveToken(token: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
+  const client = await createOAuth2Client(config, storage, memoryKey);
+  client.setCredentials({ access_token: token });
+  await storage.set(memoryKey, { accessToken: token });
+  return token;
+}
+
+// --------------------------------------------------------------------
+// Google Drive API Helpers
+// --------------------------------------------------------------------
+async function listFiles(
+  args: { pageSize?: number; query?: string } = {},
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<{ nextPageToken?: string | null; files?: drive_v3.Schema$File[] } | { error: string }> {
   try {
-    const { pageSize = 10, query = '' } = args
+    const drive = await getDriveClient(config, storage, memoryKey);
+    const { pageSize = 10, query = '' } = args;
     const res = await drive.files.list({
       pageSize,
       q: query,
       fields: 'nextPageToken, files(id, name, mimeType, modifiedTime)'
-    })
-    return { nextPageToken: res.data.nextPageToken, files: res.data.files }
+    });
+    return { nextPageToken: res.data.nextPageToken, files: res.data.files };
   } catch (err: any) {
-    return { error: String(err.message) }
+    return { error: String(err.message) };
   }
 }
 
-async function getFileMetadata(fileId: string): Promise<drive_v3.Schema$File | { error: string }> {
+async function getFileMetadata(
+  fileId: string,
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<drive_v3.Schema$File | { error: string }> {
   try {
+    const drive = await getDriveClient(config, storage, memoryKey);
     const res = await drive.files.get({
       fileId,
       fields: 'id, name, mimeType, modifiedTime, webViewLink'
-    })
-    return res.data
+    });
+    return res.data;
   } catch (err: any) {
-    return { error: String(err.message) }
+    return { error: String(err.message) };
   }
 }
 
-// Read file content with export for Docs Editors files
-async function readFile(fileId: string, exportMimeType?: string): Promise<{ content?: string } | { error: string }> {
+// Updated: Use a single object parameter for readFile to avoid optional parameter issues.
+async function readFile(params: { fileId: string; exportMimeType?: string; config: Config; storage: Storage; memoryKey: string })
+  : Promise<{ content?: string } | { error: string }> {
+  const { fileId, exportMimeType, config, storage, memoryKey } = params;
   try {
+    const drive = await getDriveClient(config, storage, memoryKey);
     const meta = await drive.files.get({
       fileId,
       fields: 'mimeType'
     });
     const fileMimeType = meta.data.mimeType;
     const exportMimeMap: { [key: string]: string } = {
-      'application/vnd.google-apps.document': 'text/plain',         // Google Docs as plain text
-      'application/vnd.google-apps.spreadsheet': 'text/csv',          // Google Sheets as CSV
-      'application/vnd.google-apps.presentation': 'application/pdf'   // Google Slides as PDF
+      'application/vnd.google-apps.document': 'text/plain',
+      'application/vnd.google-apps.spreadsheet': 'text/csv',
+      'application/vnd.google-apps.presentation': 'application/pdf'
     };
-
     if (fileMimeType && exportMimeMap[fileMimeType]) {
       const mimeToUse = exportMimeType || exportMimeMap[fileMimeType];
-      const res = await drive.files.export(
-        { fileId, mimeType: mimeToUse },
-        { responseType: 'text' }
-      );
+      const res = await drive.files.export({ fileId, mimeType: mimeToUse }, { responseType: 'text' });
       return { content: res.data as string };
     } else {
-      const res = await drive.files.get(
-        { fileId, alt: 'media' },
-        { responseType: 'text' }
-      );
+      const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'text' });
       return { content: res.data as string };
     }
   } catch (err: any) {
@@ -106,24 +194,23 @@ async function readFile(fileId: string, exportMimeType?: string): Promise<{ cont
   }
 }
 
-async function moveFile(fileId: string, newFolderId: string): Promise<{ id?: string; parents?: string[] } | { error: string }> {
+async function moveFile(
+  fileId: string,
+  newFolderId: string,
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<{ id?: string; parents?: string[] } | { error: string }> {
   try {
-    // Get current parents
-    const file = await drive.files.get({
-      fileId,
-      fields: 'parents'
-    });
+    const drive = await getDriveClient(config, storage, memoryKey);
+    const file = await drive.files.get({ fileId, fields: 'parents' });
     const previousParents = file.data.parents?.join(',') || '';
-
-    // Update the file's parents: add the new folder and remove the existing ones.
     const res = await drive.files.update({
       fileId,
       addParents: newFolderId,
       removeParents: previousParents,
       fields: 'id, parents'
     });
-
-    // Return only the properties we need.
     return {
       id: res.data.id === null ? undefined : res.data.id,
       parents: res.data.parents ?? undefined
@@ -133,9 +220,14 @@ async function moveFile(fileId: string, newFolderId: string): Promise<{ id?: str
   }
 }
 
-// New helper: Create a file
-async function createFile(args: { name: string; mimeType?: string; content: string }): Promise<drive_v3.Schema$File | { error: string }> {
+async function createFile(
+  args: { name: string; mimeType?: string; content: string },
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<drive_v3.Schema$File | { error: string }> {
   try {
+    const drive = await getDriveClient(config, storage, memoryKey);
     const res = await drive.files.create({
       requestBody: {
         name: args.name,
@@ -152,9 +244,14 @@ async function createFile(args: { name: string; mimeType?: string; content: stri
   }
 }
 
-// New helper: Update a file
-async function updateFile(args: { fileId: string; name?: string; mimeType?: string; content: string }): Promise<drive_v3.Schema$File | { error: string }> {
+async function updateFile(
+  args: { fileId: string; name?: string; mimeType?: string; content: string },
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<drive_v3.Schema$File | { error: string }> {
   try {
+    const drive = await getDriveClient(config, storage, memoryKey);
     const res = await drive.files.update({
       fileId: args.fileId,
       requestBody: {
@@ -172,9 +269,14 @@ async function updateFile(args: { fileId: string; name?: string; mimeType?: stri
   }
 }
 
-// New helper: Delete a file
-async function deleteFile(fileId: string): Promise<{ success: boolean } | { error: string }> {
+async function deleteFile(
+  fileId: string,
+  config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<{ success: boolean } | { error: string }> {
   try {
+    const drive = await getDriveClient(config, storage, memoryKey);
     await drive.files.delete({ fileId });
     return { success: true };
   } catch (err: any) {
@@ -183,182 +285,276 @@ async function deleteFile(fileId: string): Promise<{ success: boolean } | { erro
 }
 
 // --------------------------------------------------------------------
-// 5) MCP Server: Tools for Saving Token & Interacting with Drive
+// MCP Server Creation: Register Google Drive Tools
 // --------------------------------------------------------------------
-function createMcpServer(): McpServer {
+function createMcpServer(memoryKey: string, config: Config): McpServer {
   const server = new McpServer({
-    name: 'Google Drive MCP Server',
+    name: `Google Drive MCP Server (Memory Key: ${memoryKey})`,
     version: '1.0.0'
   });
 
-  // Tool to save an access token provided by the client (from Google Picker)
+  const storage: Storage = config.storage === 'upstash-redis-rest'
+    ? new RedisStorage(config.upstashRedisRestUrl!, config.upstashRedisRestToken!, config.storageHeaderKey!)
+    : new MemoryStorage();
+
   server.tool(
     'save_token',
     'Save an access token from the client for Google Drive access',
     { token: z.string() },
-    async ({ token }, extra) => {
+    async ({ token }) => {
       try {
-        oauth2Client.setCredentials({ access_token: token });
-        log('Access token saved.');
-        return wrapResponse({ success: true });
+        await saveToken(token, config, storage, memoryKey);
+        return toTextJson({ success: true });
       } catch (err: any) {
-        logErr('Failed to save token:', err);
-        return wrapResponse({ error: String(err.message) });
+        return toTextJson({ error: String(err.message) });
       }
     }
   );
 
-  // Tool to list files in Google Drive
   server.tool(
     'list_files',
     'List files in Google Drive',
     { pageSize: z.number().optional(), query: z.string().optional() },
-    async (args, extra) => {
-      const result = await listFiles(args);
-      return wrapResponse(result);
+    async (args) => {
+      const result = await listFiles(args, config, storage, memoryKey);
+      return toTextJson(result);
     }
   );
 
-  // Tool to get file metadata (renamed from get_file)
   server.tool(
     'get_file_metadata',
     'Get metadata for a specific file',
     { fileId: z.string() },
-    async ({ fileId }, extra) => {
-      const result = await getFileMetadata(fileId);
-      return wrapResponse(result);
+    async ({ fileId }) => {
+      const result = await getFileMetadata(fileId, config, storage, memoryKey);
+      return toTextJson(result);
     }
   );
 
-  // Tool to read file content
   server.tool(
     'read_file',
     'Read file content from Google Drive',
-    { fileId: z.string() },
-    async ({ fileId }, extra) => {
-      const result = await readFile(fileId);
-      return wrapResponse(result);
+    { fileId: z.string(), exportMimeType: z.string().optional() },
+    async ({ fileId, exportMimeType }) => {
+      const result = await readFile({ fileId, exportMimeType, config, storage, memoryKey });
+      return toTextJson(result);
     }
   );
 
-  // Tool to create a new file
   server.tool(
     'create_file',
     'Create a new file on Google Drive',
     { name: z.string(), mimeType: z.string().optional(), content: z.string() },
-    async (args, extra) => {
-      const result = await createFile(args);
-      return wrapResponse(result);
+    async (args) => {
+      const result = await createFile(args, config, storage, memoryKey);
+      return toTextJson(result);
     }
   );
 
-  // Tool to update an existing file
   server.tool(
     'update_file',
     'Update an existing file on Google Drive',
     { fileId: z.string(), name: z.string().optional(), mimeType: z.string().optional(), content: z.string() },
-    async (args, extra) => {
-      const result = await updateFile(args);
-      return wrapResponse(result);
+    async (args) => {
+      const result = await updateFile(args, config, storage, memoryKey);
+      return toTextJson(result);
     }
   );
 
-  // Tool to delete a file
   server.tool(
     'delete_file',
     'Delete a file from Google Drive',
     { fileId: z.string() },
-    async ({ fileId }, extra) => {
-      const result = await deleteFile(fileId);
-      return wrapResponse(result);
+    async ({ fileId }) => {
+      const result = await deleteFile(fileId, config, storage, memoryKey);
+      return toTextJson(result);
     }
   );
 
-  // New tool to move a file to a new folder
   server.tool(
     'move_file',
     'Move a file to a new folder on Google Drive',
     { fileId: z.string(), newFolderId: z.string() },
-    async ({ fileId, newFolderId }, extra) => {
-      const result = await moveFile(fileId, newFolderId);
-      return wrapResponse(result);
+    async ({ fileId, newFolderId }) => {
+      const result = await moveFile(fileId, newFolderId, config, storage, memoryKey);
+      return toTextJson(result);
     }
   );
-
-  // Additional tools (e.g., copying, permission management) can be added here.
 
   return server;
 }
 
 // --------------------------------------------------------------------
-// 6) Express Server & MCP Transport Setup
+// Minimal Fly.io "replay" handling (optional)
 // --------------------------------------------------------------------
-function main() {
-  const server = createMcpServer();
+function parseFlyReplaySrc(headerValue: string): Record<string, string> {
+  const regex = /(.*?)=(.*?)($|;)/g;
+  const matches = headerValue.matchAll(regex);
+  const result: Record<string, string> = {};
+  for (const match of matches) {
+    if (match.length >= 3) {
+      result[match[1].trim()] = match[2].trim();
+    }
+  }
+  return result;
+}
+let machineId: string | null = null;
+function saveMachineId(req: Request) {
+  if (machineId) return;
+  const headerKey = 'fly-replay-src';
+  const raw = req.headers[headerKey.toLowerCase()];
+  if (!raw || typeof raw !== 'string') return;
+  try {
+    const parsed = parseFlyReplaySrc(raw);
+    if (parsed.state) {
+      const decoded = decodeURIComponent(parsed.state);
+      const obj = JSON.parse(decoded);
+      if (obj.machineId) machineId = obj.machineId;
+    }
+  } catch {
+    // ignore
+  }
+}
 
-  if (argv.transport === 'stdio') {
+// --------------------------------------------------------------------
+// Main: Start the server (SSE or stdio) with CLI validations
+// --------------------------------------------------------------------
+async function main() {
+  const argv = yargs(hideBin(process.argv))
+    .option('port', { type: 'number', default: 8000 })
+    .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
+    .option('storage', {
+      type: 'string',
+      choices: ['memory-single', 'memory', 'upstash-redis-rest'],
+      default: 'memory-single',
+      describe:
+        'Choose storage backend: "memory-single" uses fixed single-user storage; "memory" uses multi-user in-memory storage (requires --storageHeaderKey); "upstash-redis-rest" uses Upstash Redis (requires --storageHeaderKey, --upstashRedisRestUrl, and --upstashRedisRestToken).'
+    })
+    .option('googleClientId', { type: 'string', demandOption: true, describe: "Google Client ID" })
+    .option('googleClientSecret', { type: 'string', demandOption: true, describe: "Google Client Secret" })
+    .option('googleRedirectUri', { type: 'string', demandOption: true, describe: "Google Redirect URI" })
+    .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
+    .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
+    .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
+    .help()
+    .parseSync();
+
+  const config: Config = {
+    port: argv.port,
+    transport: argv.transport as 'sse' | 'stdio',
+    storage: argv.storage as 'memory-single' | 'memory' | 'upstash-redis-rest',
+    googleClientId: argv.googleClientId,
+    googleClientSecret: argv.googleClientSecret,
+    googleRedirectUri: argv.googleRedirectUri,
+    storageHeaderKey:
+      (argv.storage === 'memory-single')
+        ? undefined
+        : (argv.storageHeaderKey && argv.storageHeaderKey.trim()
+            ? argv.storageHeaderKey.trim()
+            : (() => { console.error('Error: --storageHeaderKey is required for storage modes "memory" or "upstash-redis-rest".'); process.exit(1); return ''; })()),
+    upstashRedisRestUrl: argv.upstashRedisRestUrl,
+    upstashRedisRestToken: argv.upstashRedisRestToken,
+  };
+
+  // Additional CLI validation:
+  if ((argv.upstashRedisRestUrl || argv.upstashRedisRestToken) && config.storage !== 'upstash-redis-rest') {
+    console.error("Error: --upstashRedisRestUrl and --upstashRedisRestToken can only be used when --storage is 'upstash-redis-rest'.");
+    process.exit(1);
+  }
+  if (config.storage === 'upstash-redis-rest') {
+    if (!config.upstashRedisRestUrl || !config.upstashRedisRestUrl.trim()) {
+      console.error("Error: --upstashRedisRestUrl is required for storage mode 'upstash-redis-rest'.");
+      process.exit(1);
+    }
+    if (!config.upstashRedisRestToken || !config.upstashRedisRestToken.trim()) {
+      console.error("Error: --upstashRedisRestToken is required for storage mode 'upstash-redis-rest'.");
+      process.exit(1);
+    }
+  }
+
+  if (config.transport === 'stdio') {
+    const memoryKey = "single";
+    const server = createMcpServer(memoryKey, config);
     const transport = new StdioServerTransport();
     void server.connect(transport);
-    log('Listening on stdio');
+    console.log('Listening on stdio');
     return;
   }
 
-  const port = argv.port;
   const app = express();
-  let sessions: { server: McpServer; transport: SSEServerTransport }[] = [];
+  interface ServerSession {
+    memoryKey: string;
+    server: McpServer;
+    transport: SSEServerTransport;
+    sessionId: string;
+  }
+  let sessions: ServerSession[] = [];
 
   app.use((req, res, next) => {
     if (req.path === '/message') return next();
     express.json()(req, res, next);
   });
 
-  app.get('/', async (req: Request, res: Response) => {
+  app.get('/', async (req: Request, res: ExpressResponse) => {
+    saveMachineId(req);
+    let memoryKey: string;
+    if (config.storage === 'memory-single') {
+      memoryKey = "single";
+    } else {
+      const headerVal = req.headers[config.storageHeaderKey!.toLowerCase()];
+      if (typeof headerVal !== 'string' || !headerVal.trim()) {
+        res.status(400).json({ error: `Missing or invalid "${config.storageHeaderKey}" header` });
+        return;
+      }
+      memoryKey = headerVal.trim();
+    }
+    const server = createMcpServer(memoryKey, config);
     const transport = new SSEServerTransport('/message', res);
-    const mcpInstance = createMcpServer();
-    await mcpInstance.connect(transport);
-    sessions.push({ server: mcpInstance, transport });
-
+    await server.connect(transport);
     const sessionId = transport.sessionId;
-    log(`[${sessionId}] SSE connection established`);
-
+    sessions.push({ memoryKey, server, transport, sessionId });
+    console.log(`[${sessionId}] SSE connected for key: "${memoryKey}"`);
     transport.onclose = () => {
-      log(`[${sessionId}] SSE closed`);
+      console.log(`[${sessionId}] SSE connection closed`);
       sessions = sessions.filter(s => s.transport !== transport);
     };
     transport.onerror = (err: Error) => {
-      logErr(`[${sessionId}] SSE error:`, err);
+      console.error(`[${sessionId}] SSE error:`, err);
       sessions = sessions.filter(s => s.transport !== transport);
     };
     req.on('close', () => {
-      log(`[${sessionId}] SSE client disconnected`);
+      console.log(`[${sessionId}] Client disconnected`);
       sessions = sessions.filter(s => s.transport !== transport);
     });
   });
 
-  app.post('/message', async (req: Request, res: Response) => {
+  app.post('/message', async (req: Request, res: ExpressResponse) => {
     const sessionId = req.query.sessionId as string;
     if (!sessionId) {
-      logErr('Missing sessionId');
+      console.error('Missing sessionId');
       res.status(400).send({ error: 'Missing sessionId' });
       return;
     }
-    const target = sessions.find(s => s.transport.sessionId === sessionId);
+    const target = sessions.find(s => s.sessionId === sessionId);
     if (!target) {
-      logErr(`No active session for sessionId=${sessionId}`);
+      console.error(`No active session for sessionId=${sessionId}`);
       res.status(404).send({ error: 'No active session' });
       return;
     }
     try {
       await target.transport.handlePostMessage(req, res);
     } catch (err: any) {
-      logErr(`[${sessionId}] Error handling /message:`, err);
+      console.error(`[${sessionId}] Error handling /message:`, err);
       res.status(500).send({ error: 'Internal error' });
     }
   });
 
-  app.listen(port, () => {
-    log(`Listening on port ${port} (${argv.transport})`);
+  app.listen(config.port, () => {
+    console.log(`Listening on port ${config.port} (${argv.transport})`);
   });
 }
 
-main();
+main().catch((err: any) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
