@@ -56,7 +56,7 @@ class MemoryStorage implements Storage {
   }
 
   async set(memoryKey: string, data: Record<string, any>) {
-    // Merge new data with existing data so that a previously stored refreshToken is preserved.
+    // Merge new data with existing data so that previous tokens are preserved.
     this.storage[memoryKey] = { ...this.storage[memoryKey], ...data };
   }
 }
@@ -97,15 +97,14 @@ function getDriveScopes(): string[] {
 
 /**
  * Creates an OAuth2 client using stored credentials.
- * Throws an error if no refresh token is found.
+ * If an access token is stored, it is set on the client.
  */
 async function createOAuth2Client(config: Config, storage: Storage, memoryKey: string): Promise<OAuth2Client> {
   const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
   const stored = await storage.get(memoryKey);
-  if (!stored || !stored.refreshToken) {
-    throw new Error('No refresh token found. Please exchange an auth code first.');
+  if (stored && stored.accessToken) {
+    client.setCredentials({ access_token: stored.accessToken });
   }
-  client.setCredentials({ refresh_token: stored.refreshToken, access_token: stored.accessToken });
   return client;
 }
 
@@ -116,7 +115,6 @@ async function getDriveClient(config: Config, storage: Storage, memoryKey: strin
 
 /**
  * Returns an OAuth URL for initiating Drive authentication.
- * Note: memoryKey and storage are not needed for this function.
  */
 function getAuthUrl(config: Config): string {
   const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
@@ -128,22 +126,8 @@ function getAuthUrl(config: Config): string {
 }
 
 /**
- * Exchanges an auth code for tokens and stores the refresh token (and access token).
- */
-async function exchangeAuthCode(code: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
-  const client = new OAuth2Client(config.googleClientId, config.googleClientSecret, config.googleRedirectUri);
-  const { tokens } = await client.getToken(code.trim());
-  if (!tokens.refresh_token) {
-    throw new Error('No refresh token returned by Google.');
-  }
-  client.setCredentials(tokens);
-  await storage.set(memoryKey, { refreshToken: tokens.refresh_token, accessToken: tokens.access_token });
-  return tokens.refresh_token;
-}
-
-/**
  * Saves an access token provided by the client.
- * Merges with existing stored tokens so that refreshToken is preserved.
+ * Merges with any previously stored tokens.
  */
 async function saveToken(token: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
   let client: OAuth2Client;
@@ -331,20 +315,6 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
       try {
         const url = getAuthUrl(config);
         return toTextJson({ authUrl: url });
-      } catch (err: any) {
-        return toTextJson({ error: String(err.message) });
-      }
-    }
-  );
-
-  server.tool(
-    `${toolsPrefix}exchange_auth_code`,
-    'Exchange an auth code for a refresh token. This sets up Google Drive authentication.',
-    { code: z.string() },
-    async (args: { code: string }) => {
-      try {
-        const token = await exchangeAuthCode(args.code, config, storage, memoryKey);
-        return toTextJson({ refreshToken: token });
       } catch (err: any) {
         return toTextJson({ error: String(err.message) });
       }
