@@ -232,7 +232,7 @@ async function moveFile(
 }
 
 async function createFile(
-  args: { name: string; mimeType?: string; content: string },
+  args: { name: string; mimeType?: string; content: string; parents?: string[] },
   config: Config,
   storage: Storage,
   memoryKey: string
@@ -242,7 +242,8 @@ async function createFile(
     const res = await drive.files.create({
       requestBody: {
         name: args.name,
-        mimeType: args.mimeType || 'text/plain'
+        mimeType: args.mimeType || 'text/plain',
+        ...(args.parents ? { parents: args.parents } : {})
       },
       media: {
         mimeType: args.mimeType || 'text/plain',
@@ -368,7 +369,7 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
   server.tool(
     `${toolsPrefix}create_file`,
     'Create a new file on Google Drive.',
-    { name: z.string(), mimeType: z.string().optional(), content: z.string() },
+    { name: z.string(), mimeType: z.string().optional(), content: z.string(), parents: z.array(z.string()).optional() },
     async (args) => {
       const result = await createFile(args, config, storage, memoryKey);
       return toTextJson(result);
