@@ -339,7 +339,16 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
   server.tool(
     `${toolsPrefix}list_files`,
     'List files in Google Drive.',
-    { pageSize: z.number().optional(), query: z.string().optional() },
+    {
+      pageSize: z.number().optional(),
+      query: z.string().optional().describe(`
+Basic query syntax:
+  <query_term> <operator> <value>
+  - query_term: a field like name, mimeType, modifiedTime, starred, trashed, parents, owners, fullText, appProperties, etc.
+  - operator: one of =, !=, >, <, >=, <=, contains, in
+  - value: strings in single quotes (e.g. 'hello'), dates in RFC 3339 (e.g. '2025-04-22T00:00:00Z'), IDs in quotes.
+    `)
+    },
     async (args) => {
       const result = await listFiles(args, config, storage, memoryKey);
       return toTextJson(result);
