@@ -311,7 +311,10 @@ function createMcpServer(memoryKey: string, config: Config, toolsPrefix: string)
   server.tool(
     `${toolsPrefix}auth_url`,
     'Return an OAuth URL for Google Drive. Visit this URL to grant access.',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const url = getAuthUrl(config);
