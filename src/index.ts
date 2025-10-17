@@ -534,6 +534,16 @@ async function main() {
   if (config.transport === 'http') {
     const app = express();
 
+    app.use((req, res, next) => {
+      res.set({
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS,HEAD',
+        'Access-Control-Expose-Headers': 'MCP-Session-Id'
+      });
+      next();
+    });
+
     // Do not JSON-parse "/" — the transport handles raw body/streaming
     app.use((req, res, next) => {
       if (req.path === '/') return next();
@@ -558,6 +568,28 @@ async function main() {
     function createServerFor(memoryKey: string) {
       return createMcpServer(memoryKey, config, toolsPrefix);
     }
+
+    app.options('/', (_req, res) => {
+      res
+        .status(204)
+        .set({
+          'Content-Type': 'application/x-mcp+json',
+          'Cache-Control': 'no-cache, no-transform',
+          'Allow': 'POST,GET,DELETE,OPTIONS,HEAD'
+        })
+        .end();
+    });
+
+    app.head('/', (_req, res) => {
+      res
+        .status(204)
+        .set({
+          'Content-Type': 'application/x-mcp+json',
+          'Cache-Control': 'no-cache, no-transform',
+          'Allow': 'POST,GET,DELETE,OPTIONS,HEAD'
+        })
+        .end();
+    });
 
     // POST / — JSON-RPC input; initializes a session if none exists
     app.post('/', async (req: Request, res: ExpressResponse) => {
@@ -688,8 +720,40 @@ async function main() {
   let sessions: ServerSession[] = [];
 
   app.use((req, res, next) => {
+    res.set({
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS,HEAD',
+      'Access-Control-Expose-Headers': 'MCP-Session-Id'
+    });
+    next();
+  });
+
+  app.use((req, res, next) => {
     if (req.path === '/message') return next();
     express.json()(req, res, next);
+  });
+
+  app.options('/', (_req, res) => {
+    res
+      .status(204)
+      .set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Allow': 'GET,HEAD,OPTIONS'
+      })
+      .end();
+  });
+
+  app.head('/', (_req, res) => {
+    res
+      .status(204)
+      .set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Allow': 'GET,HEAD,OPTIONS'
+      })
+      .end();
   });
 
   app.get('/', async (req: Request, res: ExpressResponse) => {
